@@ -1,0 +1,444 @@
+name: Build iPhoneSpecs IPA
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Create Swift App Source Code
+        run: |
+          cat << 'EOF' > SpecsApp.swift
+          import SwiftUI
+          import UIKit
+          import Darwin
+          import Network
+
+          @main
+          struct iPhoneSpecsApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+
+          struct SpecItem: Identifiable {
+              let id = UUID()
+              let title: String
+              let value: String
+              let icon: String
+          }
+
+          class DeviceSpecsViewModel: ObservableObject {
+              @Published var currentFPS: Int = 0
+              @Published var liveRAMSystem: String = "جاري الحساب..."
+              @Published var liveRAMApp: String = "جاري الحساب..."
+              @Published var connectionStatus: String = "جاري الفحص..."
+              @Published var publicIP: String = "جاري الجلب..."
+              @Published var copiedAlert: Bool = false
+
+              @Published var runtimeSection: [SpecItem] = []
+              @Published var deviceSection: [SpecItem] = []
+              @Published var hardwareSection: [SpecItem] = []
+              @Published var displaySection: [SpecItem] = []
+              @Published var storageSection: [SpecItem] = []
+              @Published var batterySection: [SpecItem] = []
+
+              private var displayLink: CADisplayLink?
+              private var lastTimestamp: CFTimeInterval = 0
+              private var frameCount: Int = 0
+              private var timer: Timer?
+              private let pathMonitor = NWPathMonitor()
+
+              init() {
+                  UIDevice.current.isBatteryMonitoringEnabled = true
+                  loadStaticSpecs()
+                  startLiveMonitors()
+                  startNetworkMonitor()
+                  fetchPublicIP()
+              }
+
+              private func startLiveMonitors() {
+                  displayLink = CADisplayLink(target: self, selector: #selector(handleFrame(_:)))
+                  if #available(iOS 15.0, *) {
+                      displayLink?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+                  }
+                  displayLink?.add(to: .main, forMode: .common)
+
+                  updateRAMUsage()
+                  timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                      self?.updateRAMUsage()
+                  }
+              }
+
+              @objc private func handleFrame(_ link: CADisplayLink) {
+                  if lastTimestamp == 0 {
+                      lastTimestamp = link.timestamp
+                      return
+                  }
+                  frameCount += 1
+                  let elapsed = link.timestamp - lastTimestamp
+                  if elapsed >= 1.0 {
+                      currentFPS = Int(round(Double(frameCount) / elapsed))
+                      frameCount = 0
+                      lastTimestamp = link.timestamp
+                  }
+              }
+
+              private func updateRAMUsage() {
+                  let totalRAM = Double(ProcessInfo.processInfo.physicalMemory) / (1024 * 1024 * 1024)
+
+                  var stats = vm_statistics64()
+                  var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+                  let result = withUnsafeMutablePointer(to: &stats) {
+                      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                          host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+                      }
+                  }
+                  if result == KERN_SUCCESS {
+                      let pageSize = Double(vm_kernel_page_size)
+                      let usedBytes = Double(stats.active_count + stats.wire_count + stats.compressor_page_count) * pageSize
+                      let usedGB = usedBytes / (1024 * 1024 * 1024)
+                      liveRAMSystem = String(format: "%.2f GB / %.2f GB", usedGB, totalRAM)
+                  }
+
+                  var taskInfo = mach_task_basic_info()
+                  var taskCount = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+                  let taskResult = withUnsafeMutablePointer(to: &taskInfo) {
+                      $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                          task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &taskCount)
+                      }
+                  }
+                  if taskResult == KERN_SUCCESS {
+                      let appMB = Double(taskInfo.resident_size) / (1024 * 1024)
+                      liveRAMApp = String(format: "%.1f MB", appMB)
+                  }
+              }
+
+              private func startNetworkMonitor() {
+                  pathMonitor.pathUpdateHandler = { [weak self] path in
+                      DispatchQueue.main.async {
+                          if path.status == .satisfied {
+                              if path.usesInterfaceType(.wifi) {
+                                  self?.connectionStatus = "متصل عبر Wi-Fi 🛜"
+                              } else if path.usesInterfaceType(.cellular) {
+                                  self?.connectionStatus = "بيانات الهاتف (Cellular) 📡"
+                              } else {
+                                  self?.connectionStatus = "متصل بالإنترنت ✅"
+                              }
+                          } else {
+                              self?.connectionStatus = "غير متصل ❌"
+                          }
+                      }
+                  }
+                  pathMonitor.start(queue: DispatchQueue(label: "NetworkMonitor"))
+              }
+
+              func fetchPublicIP() {
+                  guard let url = URL(string: "https://api.ipify.org") else { return }
+                  URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                      if let data = data, let ip = String(data: data, encoding: .utf8) {
+                          DispatchQueue.main.async {
+                              self?.publicIP = ip
+                          }
+                      } else {
+                          DispatchQueue.main.async {
+                              self?.publicIP = "غير متاح"
+                          }
+                      }
+                  }.resume()
+              }
+
+              func loadStaticSpecs() {
+                  let device = UIDevice.current
+                  let process = ProcessInfo.processInfo
+                  let screen = UIScreen.main
+                  let machineId = getMachineIdentifier()
+
+                  let isLiveContainer = process.environment["LC_HOME_PATH"] != nil || Bundle.main.bundlePath.contains("LiveContainer")
+                  runtimeSection = [
+                      SpecItem(title: "بيئة التشغيل", value: isLiveContainer ? "شغال جوه LiveContainer ✅" : "مثبت مستقل (Native)", icon: "shippingbox"),
+                      SpecItem(title: "Bundle ID", value: Bundle.main.bundleIdentifier ?? "N/A", icon: "doc.text")
+                  ]
+
+                  deviceSection = [
+                      SpecItem(title: "اسم الجهاز", value: mapModelName(machineId), icon: "iphone"),
+                      SpecItem(title: "كود الموديل", value: machineId, icon: "barcode"),
+                      SpecItem(title: "إصدار النظام", value: "\(device.systemName) \(device.systemVersion)", icon: "gear"),
+                      SpecItem(title: "وقت التشغيل (Uptime)", value: formatUptime(process.systemUptime), icon: "clock")
+                  ]
+
+                  let ramGB = Double(process.physicalMemory) / (1024 * 1024 * 1024)
+                  hardwareSection = [
+                      SpecItem(title: "إجمالي الرامات", value: String(format: "%.2f GB", ramGB), icon: "memorychip"),
+                      SpecItem(title: "أنوية المعالج", value: "\(process.processorCount) أنوية (\(process.activeProcessorCount) نشطة)", icon: "cpu"),
+                      SpecItem(title: "حرارة الجهاز", value: formatThermalState(process.thermalState), icon: "thermometer.medium"),
+                      SpecItem(title: "وضع توفير الطاقة", value: process.isLowPowerModeEnabled ? "مفعل" : "غير مفعل", icon: "bolt.circle")
+                  ]
+
+                  let bounds = screen.nativeBounds
+                  displaySection = [
+                      SpecItem(title: "دقة الشاشة", value: "\(Int(bounds.width)) × \(Int(bounds.height)) px", icon: "rectangle.dashed"),
+                      SpecItem(title: "أقصى تردد للشاشة", value: "\(screen.maximumFramesPerSecond) Hz", icon: "dial.high"),
+                      SpecItem(title: "مستوى السطوع", value: "\(Int(screen.brightness * 100))%", icon: "sun.max")
+                  ]
+
+                  let storage = getStorageInfo()
+                  storageSection = [
+                      SpecItem(title: "المساحة الكلية", value: storage.total, icon: "internaldrive"),
+                      SpecItem(title: "المساحة الفاضية", value: storage.free, icon: "externaldrive.badge.checkmark")
+                  ]
+
+                  let batteryLevel = device.batteryLevel >= 0 ? "\(Int(device.batteryLevel * 100))%" : "غير معروف"
+                  batterySection = [
+                      SpecItem(title: "نسبة الشحن", value: batteryLevel, icon: "battery.100"),
+                      SpecItem(title: "حالة البطارية", value: formatBatteryState(device.batteryState), icon: "bolt.fill")
+                  ]
+              }
+
+              func copyAllSpecs() {
+                  let allSections = [
+                      ("الأداء اللحظي", [
+                          SpecItem(title: "معدل الإطارات", value: "\(currentFPS) FPS", icon: ""),
+                          SpecItem(title: "الرامات المستهلكة", value: liveRAMSystem, icon: ""),
+                          SpecItem(title: "استهلاك التطبيق", value: liveRAMApp, icon: "")
+                      ]),
+                      ("الشبكة", [
+                          SpecItem(title: "حالة الاتصال", value: connectionStatus, icon: ""),
+                          SpecItem(title: "الـ IP الخارجي", value: publicIP, icon: "")
+                      ]),
+                      ("بيئة التشغيل", runtimeSection),
+                      ("الجهاز والنظام", deviceSection),
+                      ("المعالج والعتاد", hardwareSection),
+                      ("الشاشة", displaySection),
+                      ("التخزين", storageSection),
+                      ("البطارية", batterySection)
+                  ]
+
+                  var report = "📱 تقرير مواصفات الآيفون:\n====================\n"
+                  for (sectionTitle, items) in allSections {
+                      report += "\n[\(sectionTitle)]\n"
+                      for item in items {
+                          report += "• \(item.title): \(item.value)\n"
+                      }
+                  }
+                  UIPasteboard.general.string = report
+                  copiedAlert = true
+              }
+
+              private func getMachineIdentifier() -> String {
+                  var systemInfo = utsname()
+                  uname(&systemInfo)
+                  let machineMirror = Mirror(reflecting: systemInfo.machine)
+                  return machineMirror.children.reduce("") { identifier, element in
+                      guard let value = element.value as? Int8, value != 0 else { return identifier }
+                      return identifier + String(UnicodeScalar(UInt8(value)))
+                  }
+              }
+
+              private func getStorageInfo() -> (total: String, free: String) {
+                  let fileURL = URL(fileURLWithPath: NSHomeDirectory() as String)
+                  do {
+                      let values = try fileURL.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey])
+                      let total = Int64(values.volumeTotalCapacity ?? 0)
+                      let free = values.volumeAvailableCapacityForImportantUsage ?? 0
+                      let formatter = ByteCountFormatter()
+                      formatter.allowedUnits = [.useGB]
+                      formatter.countStyle = .decimal
+                      return (formatter.string(fromByteCount: total), formatter.string(fromByteCount: free))
+                  } catch {
+                      return ("غير متاح", "غير متاح")
+                  }
+              }
+
+              private func formatUptime(_ seconds: TimeInterval) -> String {
+                  let hours = Int(seconds) / 3600
+                  let minutes = (Int(seconds) % 3600) / 60
+                  return "\(hours) ساعة و \(minutes) دقيقة"
+              }
+
+              private func formatThermalState(_ state: ProcessInfo.ThermalState) -> String {
+                  switch state {
+                  case .nominal: return "طبيعية ممتازة"
+                  case .fair: return "دافئة قليلاً"
+                  case .serious: return "عالية"
+                  case .critical: return "حرجة جداً"
+                  @unknown default: return "غير معروف"
+                  }
+              }
+
+              private func formatBatteryState(_ state: UIDevice.BatteryState) -> String {
+                  switch state {
+                  case .charging: return "بيشحن حالياً ⚡️"
+                  case .full: return "مشحون بالكامل 100%"
+                  case .unplugged: return "مفصول من الشاحن"
+                  default: return "غير معروف"
+                  }
+              }
+
+              private func mapModelName(_ id: String) -> String {
+                  let models: [String: String] = [
+                      "iPhone15,2": "iPhone 14 Pro", "iPhone15,3": "iPhone 14 Pro Max",
+                      "iPhone15,4": "iPhone 15", "iPhone15,5": "iPhone 15 Plus",
+                      "iPhone16,1": "iPhone 15 Pro", "iPhone16,2": "iPhone 15 Pro Max",
+                      "iPhone17,1": "iPhone 16 Pro", "iPhone17,2": "iPhone 16 Pro Max",
+                      "iPhone17,3": "iPhone 16", "iPhone17,4": "iPhone 16 Plus",
+                      "iPhone17,5": "iPhone 16e",
+                      "iPhone18,1": "iPhone 17 Pro", "iPhone18,2": "iPhone 17 Pro Max",
+                      "iPhone18,3": "iPhone 17", "iPhone18,4": "iPhone 17 Air"
+                  ]
+                  return models[id] ?? id
+              }
+          }
+
+          struct ContentView: View {
+              @StateObject private var vm = DeviceSpecsViewModel()
+
+              var body: some View {
+                  NavigationView {
+                      List {
+                          Section(header: Text("مراقب الأداء اللحظي (Live)")) {
+                              liveRow(title: "معدل الإطارات (FPS)", value: "\(vm.currentFPS) FPS", icon: "speedometer", color: .green)
+                              liveRow(title: "الرامات المستهلكة", value: vm.liveRAMSystem, icon: "memorychip.fill", color: .orange)
+                              liveRow(title: "استهلاك التطبيق", value: vm.liveRAMApp, icon: "app.badge.checkmark", color: .purple)
+                          }
+
+                          Section(header: Text("الشبكة والـ IP")) {
+                              liveRow(title: "حالة الاتصال", value: vm.connectionStatus, icon: "wifi", color: .blue)
+                              liveRow(title: "الـ IP الخارجي", value: vm.publicIP, icon: "globe", color: .blue)
+                          }
+
+                          specSection(title: "LiveContainer & البيئة", items: vm.runtimeSection)
+                          specSection(title: "الجهاز والنظام", items: vm.deviceSection)
+                          specSection(title: "المعالج والعتاد", items: vm.hardwareSection)
+                          specSection(title: "الشاشة", items: vm.displaySection)
+                          specSection(title: "المساحة والتخزين", items: vm.storageSection)
+                          specSection(title: "البطارية", items: vm.batterySection)
+                      }
+                      .navigationTitle("مواصفات الآيفون")
+                      .toolbar {
+                          ToolbarItemGroup(placement: .navigationBarTrailing) {
+                              Button(action: { vm.copyAllSpecs() }) {
+                                  Image(systemName: "doc.on.doc")
+                              }
+                              Button(action: {
+                                  vm.loadStaticSpecs()
+                                  vm.fetchPublicIP()
+                              }) {
+                                  Image(systemName: "arrow.clockwise")
+                              }
+                          }
+                      }
+                      .alert("تم النسخ ✅", isPresented: $vm.copiedAlert) {
+                          Button("تمام", role: .cancel) { }
+                      } message: {
+                          Text("تم نسخ تقرير المواصفات بالكامل للحافظة.")
+                      }
+                  }
+              }
+
+              @ViewBuilder
+              private func liveRow(title: String, value: String, icon: String, color: Color) -> some View {
+                  HStack {
+                      Image(systemName: icon)
+                          .foregroundColor(color)
+                          .frame(width: 28)
+                      Text(title)
+                          .fontWeight(.medium)
+                      Spacer()
+                      Text(value)
+                          .fontWeight(.bold)
+                          .foregroundColor(.primary)
+                  }
+                  .padding(.vertical, 2)
+              }
+
+              @ViewBuilder
+              private func specSection(title: String, items: [SpecItem]) -> some View {
+                  Section(header: Text(title)) {
+                      ForEach(items) { item in
+                          HStack {
+                              Image(systemName: item.icon)
+                                  .foregroundColor(.blue)
+                                  .frame(width: 28)
+                              Text(item.title)
+                                  .fontWeight(.medium)
+                              Spacer()
+                              Text(item.value)
+                                  .foregroundColor(.secondary)
+                                  .multilineTextAlignment(.trailing)
+                          }
+                          .padding(.vertical, 2)
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Create XcodeGen Config
+        run: |
+          cat << 'EOF' > project.yml
+          name: iPhoneSpecs
+          options:
+            bundleIdPrefix: com.mohamed
+          targets:
+            iPhoneSpecs:
+              type: application
+              platform: iOS
+              deploymentTarget: "15.0"
+              sources:
+                - SpecsApp.swift
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.mohamed.iphonespecs
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
+                  INFOPLIST_KEY_CADisableMinimumFrameDurationOnPhone: YES
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+                  CODE_SIGN_IDENTITY: ""
+                  CODE_SIGNING_REQUIRED: NO
+                  CODE_SIGNING_ALLOWED: NO
+          EOF
+
+      - name: Generate and Build Unsigned IPA
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild clean build \
+            -project iPhoneSpecs.xcodeproj \
+            -scheme iPhoneSpecs \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/iPhoneSpecs.app Payload/
+          zip -r9 iPhoneSpecs.ipa Payload
+
+      - name: Upload IPA to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneSpecs-IPA
+          path: iPhoneSpecs.ipa
+
+      - name: Publish Direct IPA to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "iPhoneSpecs IPA (Ready for LiveContainer)"
+          files: iPhoneSpecs.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
